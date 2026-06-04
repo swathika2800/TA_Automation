@@ -7,17 +7,28 @@ __pycache__/
 venv/
 *.log
 .DS_Store
-resumes/**/_tmp/
-resumes/**/shortlisted/
+resumes/
 outputs/
-logs/*.json
+logs/
+
+# Keep folder structures but ignore contents
 !logs/.gitkeep
 !resumes/.gitkeep
 !outputs/.gitkeep
-screenshots/
-*.pdf
 !jd_input/.gitkeep
 !screening_guidelines/.gitkeep
+
+# Sensitive inputs and configurations
+jd_input/
+screening_guidelines/
+config/naukri_cookies.json
+config/settings.json
+
+screenshots/
+video_frames/
+*.pdf
+*.mp4
+
 tests/__pycache__/
 .mypy_cache/
 .ruff_cache/
