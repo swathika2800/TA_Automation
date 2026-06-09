@@ -35,3 +35,4 @@ tests/__pycache__/
 playwright-report/
 test-results/
 naukri_profile/
+page_content.html
