@@ -14,7 +14,10 @@ from src.criteria_builder import (
     HardFilter, build_boolean_query_dict, generate_boolean_query,
     load_guidelines,
 )
-from src.jd_loader import JobDescription, _read_excel, load_jds
+from src.jd_loader import (
+    JobDescription, _read_excel, _parse_range_string, _truthy,
+    load_jds,
+)
 
 
 def _settings():
@@ -225,6 +228,131 @@ class TestJDLoaderRobustness(unittest.TestCase):
         ])
         result = load_jds(self._settings(), excel_path=path)
         self.assertEqual([j.jd_id for j in result], ["JD020"])
+
+
+class TestParseRangeString(unittest.TestCase):
+    """Test parsing of combined experience range strings."""
+
+    def test_standard_range(self):
+        self.assertEqual(_parse_range_string("5-8 yrs"), (5, 8))
+
+    def test_range_with_plus(self):
+        self.assertEqual(_parse_range_string("5+ to 8+ Years"), (5, 8))
+
+    def test_range_with_spaces(self):
+        self.assertEqual(_parse_range_string("5 - 8 years"), (5, 8))
+
+    def test_single_number(self):
+        self.assertEqual(_parse_range_string("5 years"), (5, 5))
+        self.assertEqual(_parse_range_string("5+ yrs"), (5, 5))
+
+    def test_empty_string(self):
+        self.assertEqual(_parse_range_string(""), (0, 0))
+        self.assertEqual(_parse_range_string(None), (0, 0))
+
+    def test_non_numeric(self):
+        self.assertEqual(_parse_range_string("Fresher"), (0, 0))
+
+
+class TestTruthyWithStatusValues(unittest.TestCase):
+    """The _truthy function must accept Naukri Search Automation statuses."""
+
+    def test_pending_is_truthy(self):
+        self.assertTrue(_truthy("Pending"))
+
+    def test_in_progress_is_truthy(self):
+        self.assertTrue(_truthy("In Progress"))
+
+    def test_standard_truthy_values(self):
+        self.assertTrue(_truthy(True))
+        self.assertTrue(_truthy("TRUE"))
+        self.assertTrue(_truthy("Active"))
+        self.assertTrue(_truthy("Open"))
+
+    def test_falsy_values(self):
+        self.assertFalse(_truthy(False))
+        self.assertFalse(_truthy("Closed"))
+        self.assertFalse(_truthy("Completed"))
+        self.assertFalse(_truthy(""))
+        self.assertFalse(_truthy(None))
+
+
+class TestNewExcelFormat(unittest.TestCase):
+    """Test that the Naukri Search Automation Excel format loads correctly."""
+
+    def _settings(self):
+        return _settings()
+
+    def _write(self, name, headers, rows):
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        for c, h in enumerate(headers, 1):
+            ws.cell(row=1, column=c, value=h)
+        for r_idx, row in enumerate(rows, start=2):
+            for c_idx, val in enumerate(row, start=1):
+                ws.cell(row=r_idx, column=c_idx, value=val)
+        path = Path(f"/tmp/{name}")
+        wb.save(path)
+        return path
+
+    def test_loads_new_format_with_jd_description(self):
+        path = self._write("new_format.xlsx", [
+            "Job ID", "Job Title", "Job Description", "Location",
+            "Experience Required", "Key Skills", "Priority", "Status",
+        ], [
+            ["JD-001", "Data Scientist",
+             "Role: Data Scientist\nSkills: Python, ML\nExperience: 5+ yrs",
+             "Remote / India", "5-8 yrs",
+             "Python, Machine Learning, SQL", "High", "Pending"],
+        ])
+        result = load_jds(self._settings(), excel_path=path)
+        self.assertEqual(len(result), 1)
+        jd = result[0]
+        self.assertEqual(jd.jd_id, "JD-001")
+        self.assertEqual(jd.role, "Data Scientist")
+        self.assertIn("Python", jd.skills)
+        self.assertIn("Machine Learning", jd.skills)
+        self.assertEqual(jd.experience_min, 5)
+        self.assertEqual(jd.experience_max, 8)
+        self.assertIn("Remote", jd.locations[0])
+        # jd_description should be populated
+        self.assertIn("Role: Data Scientist", jd.jd_description)
+        self.assertIn("Skills: Python", jd.jd_description)
+
+    def test_loads_new_format_inactive_status(self):
+        path = self._write("inactive.xlsx", [
+            "Job ID", "Job Title", "Job Description", "Location",
+            "Experience Required", "Key Skills", "Status",
+        ], [
+            ["JD-010", "Role A", "desc", "India", "3-5 yrs", "SkillX", "Pending"],
+            ["JD-011", "Role B", "desc", "India", "3-5 yrs", "SkillY", "Completed"],
+            ["JD-012", "Role C", "desc", "India", "3-5 yrs", "SkillZ", "Closed"],
+        ])
+        result = load_jds(self._settings(), excel_path=path)
+        self.assertEqual([j.jd_id for j in result], ["JD-010"])
+
+    def test_missing_ctc_and_freshness_uses_none(self):
+        """New format doesn't have CTC/Freshness columns; should default to None."""
+        path = self._write("no_ctc.xlsx", [
+            "Job ID", "Job Title", "Job Description", "Location",
+            "Experience Required", "Key Skills", "Status",
+        ], [
+            ["JD-020", "Engineer", "desc", "India", "5-8 yrs", "SkillA", "Pending"],
+        ])
+        result = load_jds(self._settings(), excel_path=path)
+        jd = result[0]
+        self.assertIsNone(jd.ctc_ceiling_lacs)
+        self.assertIsNone(jd.freshness_days)
+
+    def test_jd_description_in_to_dict(self):
+        jd = JobDescription(
+            jd_id="JD-TEST", role="Tester", skills=["X"],
+            experience_min=1, experience_max=5, locations=["Any"],
+            notes="", jd_description="Full JD text here",
+        )
+        d = jd.to_dict()
+        self.assertEqual(d["jd_description"], "Full JD text here")
 
 
 class TestSCOUTFiltersInHardFilter(unittest.TestCase):

@@ -55,17 +55,18 @@ class Candidate:
 # experience. The first real run should be HEADLESS=false so the team can
 # inspect and refine them. Once a working set is confirmed, freeze it here.
 SELECTORS = {
-    "login_username": 'input[placeholder*="Email"], input[type="text"], input#usernameField',
+    "login_username": 'input[placeholder*="registered email"], input[placeholder*="Email"], input[type="email"], input#usernameField',
     "login_password": 'input[type="password"], input#passwordField',
-    "login_submit":   'button[type="submit"], input[type="submit"], button.loginButton',
+    "login_submit":   'button[type="submit"], button:has-text("Log in"), input[type="submit"], button.loginButton',
+    "register_login_btn": 'button:has-text("Register/Log in")',
 
-    "search_input":   'input#FZ_KEYWORD_ANY, input[placeholder*="Skills"], input[placeholder*="Keywords"]',
-    "exp_min_input":  'input#expMin, input[placeholder*="Min"], input[id*="expMin"]',
-    "exp_max_input":  'input#expMax, input[placeholder*="Max"], input[id*="expMax"]',
-    "loc_input":      'input#location, input[placeholder*="Location"], input[id*="location"]',
-    "ctc_input":      'input#ctc, input[placeholder*="CTC"], input[id*="ctc"]',
-    "active_in_dropdown": 'select#activeIn, select[id*="activeIn"]',
-    "search_button":  'button:has-text("Search"), button#search, input[type="submit"][value*="Search"]',
+    "search_input":   'input[placeholder*="keywords"], input[placeholder*="Keywords"]',
+    "exp_min_input":  'input[placeholder*="Min experience"]',
+    "exp_max_input":  'input[placeholder*="Max experience"]',
+    "loc_input":      'input[placeholder*="location"], input[placeholder*="Location"]',
+    "ctc_input":      'input[placeholder*="Min salary"]',
+    "active_in_dropdown": 'input#adv-active-in',
+    "search_button":  'button:has-text("Search candidates")',
 
     "candidate_card": '.tuple, .candidate-card, [class*="tuple"], [class*="candidate-card"], [data-testid*="result"]',
     "profile_name":   '.name, h1, .candidateName, [class*="name"]',
@@ -152,52 +153,168 @@ class NaukriBot:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.settings.headless,
-            slow_mo=self.settings.raw.get("playwright", {}).get("slow_mo_ms", 0),
-        )
-        
-        state_path = self.settings.session_dir.parent / "naukri_state.json"
-        
-        viewport = self.settings.raw.get("playwright", {}).get("viewport", {"width": 1440, "height": 900})
-        user_agent = self.settings.raw.get("playwright", {}).get("user_agent")
-        
-        if state_path.exists():
-            logger.info(f"Reusing saved session from {state_path}")
-            self._context = await self._browser.new_context(
-                storage_state=str(state_path),
-                viewport=viewport,
-                user_agent=user_agent,
-            )
+
+        # CDP mode (optional) — connects to an already-running Chrome with
+        # --remote-debugging-port.  Turn on in settings.json if you can keep
+        # a CDP-enabled Chrome running stably.  Otherwise the bot launches
+        # its own browser (recommended).
+        use_cdp = self.settings.raw.get("playwright", {}).get("use_cdp", False)
+        self._connected_via_cdp = False
+        if use_cdp:
+            cdp_host = self.settings.raw.get("playwright", {}).get("cdp_host", "127.0.0.1")
+            cdp_port = self.settings.raw.get("playwright", {}).get("cdp_port", 9222)
+            cdp_url = f"http://{cdp_host}:{cdp_port}"
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+                self._connected_via_cdp = True
+                logger.info("Connected to existing Chrome at %s", cdp_url)
+            except Exception as exc:
+                logger.info("CDP connect failed (%s). Falling back to fresh browser.", exc)
         else:
-            logger.info("No saved session found. You will need to log in.")
-            self._context = await self._browser.new_context(
-                viewport=viewport,
-                user_agent=user_agent,
+            logger.info("CDP mode disabled. Launching fresh browser.")
+
+        if not self._connected_via_cdp:
+            # If no saved session exists and we're launching fresh, the user
+            # will need to log in interactively — force a visible browser so
+            # they can see the login page and enter the OTP.
+            effective_headless = self.settings.headless
+            no_saved_session = not (self.settings.session_dir.parent / "naukri_state.json").exists()
+            if effective_headless and no_saved_session:
+                logger.info(
+                    "No saved session — switching to visible browser so you "
+                    "can log in.  (Set HEADLESS=true in .env after the first "
+                    "successful run to hide the browser.)"
+                )
+                effective_headless = False
+
+            # Use system Chrome (channel="chrome") for a real User-Agent and
+            # proper networking.  Playwright's bundled Chromium often gets
+            # blocked by CDNs because its UA contains "HeadlessChrome".
+            self._browser = await self._playwright.chromium.launch(
+                headless=effective_headless,
+                slow_mo=self.settings.raw.get("playwright", {}).get("slow_mo_ms", 0),
+                channel="chrome",
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-gpu",
+                ],
             )
-            
-        self._page = await self._context.new_page()
+
+        state_path = self.settings.session_dir.parent / "naukri_state.json"
+
+        if self._connected_via_cdp:
+            # Collect ALL existing pages across ALL contexts — don't open
+            # new tabs when the user already has Chrome tabs open.
+            all_contexts = self._browser.contexts
+            all_pages: list[tuple] = []   # (context, page)
+            for ctx in all_contexts:
+                for p in ctx.pages:
+                    all_pages.append((ctx, p))
+
+            logger.info(
+                "CDP: %d context(s), %d page(s) total",
+                len(all_contexts), len(all_pages),
+            )
+            for ctx, p in all_pages:
+                logger.debug("  page: %s", p.url)
+
+            # Try to find a page that already shows Naukri
+            naukri_page = None
+            naukri_ctx = None
+            for ctx, p in all_pages:
+                url = p.url.lower()
+                if "naukri.com" in url:
+                    naukri_page = p
+                    naukri_ctx = ctx
+                    logger.info("Found existing Naukri tab: %s", p.url)
+                    break
+
+            if naukri_page:
+                self._context = naukri_ctx
+                self._page = naukri_page
+            elif all_pages:
+                # Reuse the first available page (active tab) and navigate it
+                self._context, self._page = all_pages[0]
+                logger.info(
+                    "No Naukri tab found; reusing page: %s",
+                    self._page.url,
+                )
+            else:
+                # Truly no pages — only now create a new one
+                self._context = (
+                    all_contexts[0]
+                    if all_contexts
+                    else await self._browser.new_context()
+                )
+                self._page = await self._context.new_page()
+                logger.info("No existing pages — created a new tab")
+        else:
+            viewport = self.settings.raw.get("playwright", {}).get("viewport", {"width": 1440, "height": 900})
+            user_agent = self.settings.raw.get("playwright", {}).get("user_agent")
+            if state_path.exists():
+                logger.info(f"Reusing saved session from {state_path}")
+                self._context = await self._browser.new_context(
+                    storage_state=str(state_path),
+                    viewport=viewport,
+                    user_agent=user_agent,
+                )
+            else:
+                logger.info("No saved session found. You will need to log in.")
+                self._context = await self._browser.new_context(
+                    viewport=viewport,
+                    user_agent=user_agent,
+                )
+            self._page = await self._context.new_page()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         try:
-            if self._context:
-                state_path = self.settings.session_dir.parent / "naukri_state.json"
-                await self._context.storage_state(path=str(state_path))
-                logger.info(f"Saved browser session to {state_path}")
-                await self._context.close()
-            if self._browser:
-                await self._browser.close()
+            if self._connected_via_cdp:
+                # Borrowed the user's Chrome — do NOT close it or save state
+                logger.info("CDP mode: leaving your Chrome open")
+            else:
+                # We launched our own browser — clean up
+                if self._context:
+                    if exc_type is None:
+                        state_path = self.settings.session_dir.parent / "naukri_state.json"
+                        await self._context.storage_state(path=str(state_path))
+                        logger.info(f"Saved browser session to {state_path}")
+                    else:
+                        logger.info("Skipping session save due to error")
+                    await self._context.close()
+                if self._browser:
+                    await self._browser.close()
         finally:
             await self._playwright.stop()
 
-    # --- anti-detection --------------------------------------------------
+    # --- helpers ---------------------------------------------------------
+
+    async def _on_chrome_error_page(self) -> bool:
+        """Return True if the current page is Chrome's internal error page."""
+        return self._page.url.lower().startswith("chrome-error://")
 
     async def _jitter(self) -> None:
         cfg = self.settings.raw.get("playwright", {})
         lo = int(cfg.get("action_jitter_min_ms", 2000))
         hi = int(cfg.get("action_jitter_max_ms", 5000))
         await asyncio.sleep(random.uniform(lo, hi) / 1000)
+
+    async def _safe_goto(
+        self, url: str, *, timeout: int = 30000, retries: int = 2,
+    ) -> bool:
+        """Navigate to *url* and return True if we land on a real page (not
+        chrome-error://).  Retries once if an error page appears."""
+        for attempt in range(1, retries + 1):
+            try:
+                await self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await asyncio.sleep(1)
+                if not await self._on_chrome_error_page():
+                    return True
+                logger.debug("chrome-error page after goto (attempt %d/%d)", attempt, retries)
+            except Exception as exc:
+                logger.debug("goto %s failed (attempt %d/%d): %s", url, attempt, retries, exc)
+        return False
 
     # --- public steps ----------------------------------------------------
 
@@ -212,24 +329,93 @@ class NaukriBot:
             "resdex_url", "https://resdex.naukri.com/v3/search"
         )
 
-        logger.info("Checking if already logged in...")
-        await self._page.goto(resdex_url, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle")
-
-        if "resdex.naukri.com" in self._page.url.lower() and "login" not in self._page.url.lower():
-            logger.info("Already logged in! Reusing saved session.")
+        # --- Step 0: If we're already on Resdex (CDP mode), skip everything ---
+        current_url = self._page.url.lower()
+        if "resdex.naukri.com" in current_url and "login" not in current_url:
+            logger.info("Already on Resdex — no login needed!")
             return
 
+        # --- Step 1: Check session via the public homepage (safe) ---
+        # Do NOT go directly to resdex — Naukri's servers reject
+        # unauthenticated requests to it with ERR_HTTP2_PROTOCOL_ERROR.
+        logger.info("Checking if already logged in...")
+        session_valid = False
+        ok = await self._safe_goto("https://www.naukri.com", timeout=15000)
+        if ok:
+            await asyncio.sleep(2)
+            current_url = self._page.url.lower()
+            # If we land on a page that is NOT the login page, session is likely valid
+            if "naukri.com" in current_url and "login" not in current_url:
+                # Now try accessing Resdex to confirm recruiter access
+                ok2 = await self._safe_goto(resdex_url, timeout=15000)
+                if ok2:
+                    await asyncio.sleep(2)
+                    if "resdex.naukri.com" in self._page.url.lower() and "login" not in self._page.url.lower():
+                        logger.info("Already logged in with Resdex access! Reusing saved session.")
+                        session_valid = True
+
+        if session_valid:
+            return
+
+        # --- Step 2: Navigate to login page ---
         logger.warning("Not logged in. Navigating to login page...")
-        await self._page.goto(login_url, wait_until="domcontentloaded")
+        ok = await self._safe_goto(login_url, timeout=20000)
+        if not ok:
+            # Navigation failed outright (chrome-error), likely a network / CDN issue.
+            print("\n" + "!" * 80)
+            print("!!! BROWSER NAVIGATION FAILED !!!")
+            print("The browser cannot reach Naukri.com.")
+            print("")
+            print("Possible fixes (try in order):")
+            print("  1. Use your real Chrome session (recommended):")
+            print("     - Open chrome://inspect/#remote-debugging in Chrome")
+            print("     - Enable \"Discover network targets\"")
+            print("     - Re-run the bot — it will reuse your signed-in session.")
+            print("")
+            print("  2. Check if your network/firewall blocks Naukri.com.")
+            print("")
+            print("  3. Set HEADLESS=false in config/.env to see what the")
+            print("     browser shows on screen.")
+            print("!" * 80 + "\n")
+            raise RuntimeError(
+                "Cannot navigate to Naukri.com — the browser shows a "
+                "chrome-error page.  See instructions above."
+            )
+
         await self._jitter()
 
+        # The recruiter login page first shows a "Register/Log in" button.
+        # Click it to reveal the actual login form.
         try:
+            reg_btn = self._page.locator(SELECTORS["register_login_btn"])
+            if await reg_btn.is_visible(timeout=5000):
+                await reg_btn.click()
+                await asyncio.sleep(3)
+                await self._jitter()
+                logger.info("Clicked 'Register/Log in' button to show login form")
+        except Exception as exc:
+            logger.debug("Register/Log in button not found (already on login form?): %s", exc)
+
+        try:
+            # Wait for the email input to actually appear
+            email_input = self._page.locator(SELECTORS["login_username"])
+            await email_input.wait_for(state="visible", timeout=10000)
             # Auto-fill the email and password to save the recruiter time
-            await self._page.fill(SELECTORS["login_username"], self.settings.naukri_username)
+            await email_input.fill(self.settings.naukri_username)
             await self._page.fill(SELECTORS["login_password"], self.settings.naukri_password)
+            logger.info("Filled email and password")
         except Exception as exc:
             logger.debug("Could not auto-fill login: %s", exc)
+
+        # Click the "Log in" button to trigger OTP send
+        try:
+            login_btn = self._page.locator(SELECTORS["login_submit"])
+            if await login_btn.is_visible(timeout=5000):
+                await login_btn.click()
+                logger.info("Clicked 'Log in' button — OTP should be sent")
+                await self._jitter()
+        except Exception as exc:
+            logger.debug("Could not click Log in button: %s", exc)
 
         print("\n" + "!"*80)
         print("!!! ACTION REQUIRED: PLEASE LOG IN TO NAUKRI IN THE BROWSER WINDOW !!!")
@@ -241,15 +427,45 @@ class NaukriBot:
         # Pause the script and wait for the user to press Enter
         await asyncio.to_thread(input, "Press ENTER when you are successfully logged in: ")
 
-        logger.info("Navigating to Resdex search...")
-        await self._page.goto(resdex_url, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle")
+        logger.info("Login complete. You can keep the dashboard tab open.")
+
+    async def _ensure_page(self) -> bool:
+        """If the current page was closed, try to re-acquire a Naukri page.
+        Returns True if we have a usable page."""
+        try:
+            url = self._page.url
+            return True  # page is still alive
+        except Exception:
+            pass
+        # Page is dead — try to find a replacement in CDP mode
+        if self._connected_via_cdp and self._browser:
+            for ctx in self._browser.contexts:
+                for p in ctx.pages:
+                    url = p.url.lower()
+                    if "naukri.com" in url or "resdex.naukri.com" in url:
+                        self._context = ctx
+                        self._page = p
+                        logger.info("Re-acquired Naukri page: %s", p.url)
+                        return True
+        return False
 
     async def search(self, boolean_query: str) -> AsyncIterator[Candidate]:
         """Yield Candidate objects. Applies HardFilter BEFORE downloading."""
+        # Navigate to Resdex first (in case we're still on dashboard)
+        resdex_url = self.settings.raw.get("naukri", {}).get(
+            "resdex_url", "https://resdex.naukri.com/v3/search"
+        )
+        if not await self._ensure_page():
+            raise RuntimeError("Naukri page was closed. Please re-run with a Naukri tab open.")
+        logger.info("Navigating to Resdex search...")
+        ok = await self._safe_goto(resdex_url, timeout=20000)
+        if not ok:
+            raise RuntimeError("Could not navigate to Resdex. Are you logged in?")
+        await asyncio.sleep(3)
+
         await self._fill_filters(boolean_query)
         await self._page.click(SELECTORS["search_button"])
-        await self._page.wait_for_load_state("networkidle")
+        await asyncio.sleep(3)
         await self._jitter()
 
         cap = self.settings.max_resumes_per_jd
@@ -292,7 +508,7 @@ class NaukriBot:
                 break
             try:
                 await nxt.click()
-                await self._page.wait_for_load_state("networkidle")
+                await asyncio.sleep(4)
                 await self._jitter()
             except Exception:
                 break

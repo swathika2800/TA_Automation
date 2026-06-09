@@ -82,6 +82,10 @@ def _build_user_prompt(jd: dict[str, Any], resume: dict[str, Any]) -> str:
         f"Experience range: {jd['experience_min']}-{jd['experience_max']} years\n"
         f"Locations: {', '.join(jd['locations'])}\n"
     )
+    # Include full JD description when available for much more accurate scoring
+    desc = (jd.get("jd_description") or "").strip()
+    if desc:
+        jd_text += f"\nFull Job Description:\n{desc[:3000]}\n"
     resume_text = (
         f"Total experience (years): {resume.get('total_experience_years')}\n"
         f"Skills: {', '.join(resume.get('skills', []))}\n"

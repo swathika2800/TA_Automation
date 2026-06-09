@@ -10,6 +10,7 @@ no log, no PDF, no profile JSON. The HardFilter is therefore in-memory only.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,79 +119,179 @@ def _parse_kv(block: str) -> dict[str, str]:
 def load_guidelines(settings: Settings, jd: JobDescription) -> HardFilter:
     """Read `screening_guidelines/<JD_ID>_*.md` and return HardFilter.
 
-    Falls back to JD-only defaults (skills become mandatory, experience/location
-    from JD, AI min_score from settings.json) when the file is absent.
+    Falls back to:
+      1. Claude extraction from `jd.jd_description` (when available)
+      2. JD-only defaults (skills become mandatory, experience/location
+         from JD, AI min_score from settings.json)
     """
     pattern = f"{jd.jd_id}_*.md"
     matches = sorted(settings.guidelines_dir.glob(pattern))
-    if not matches:
-        logger.warning(
-            "No guidelines file for %s; using JD defaults", jd.jd_id,
+    if matches:
+        path = matches[0]
+        text = path.read_text(encoding="utf-8")
+
+        mandatory = _parse_bullets(_section_block(text, "Mandatory Skills"))
+        preferred = _parse_bullets(_section_block(text, "Preferred Skills"))
+
+        exp_kv = _parse_kv(_section_block(text, "Experience"))
+        exp_min = int(exp_kv.get("min_years", jd.experience_min))
+        exp_max = int(exp_kv.get("max_years", jd.experience_max))
+
+        locations = _parse_bullets(_section_block(text, "Location"))
+        if not locations:
+            locations = list(jd.locations)
+
+        rejection_text = _section_block(text, "Rejection Criteria")
+        max_np: int | None = None
+        for line in rejection_text.splitlines():
+            m = re.search(r"notice_period_days\s*>\s*(\d+)", line)
+            if m:
+                max_np = int(m.group(1))
+                break
+
+        ai_kv = _parse_kv(_section_block(text, "AI Screening"))
+        default_min_score = settings.raw.get("filters", {}).get("default_min_score", 60)
+        min_score = int(ai_kv.get("min_score", default_min_score))
+
+        filter_kv = _parse_kv(_section_block(text, "Filters"))
+        ctc_ceiling = _safe_float(filter_kv.get("ctc_ceiling_lacs")) or jd.ctc_ceiling_lacs
+        freshness = _safe_int(filter_kv.get("freshness_days")) or jd.freshness_days
+        if freshness is None:
+            freshness = settings.raw.get("filters", {}).get("freshness_days", 45)
+
+        if not mandatory:
+            mandatory = list(jd.skills)
+
+        logger.info(
+            "Guidelines from markdown for %s: mandatory=%s preferred=%s exp=[%d-%d] locs=%s np<=%s ctc<=%s fresh<=%dd score>=%d",
+            jd.jd_id, mandatory, preferred, exp_min, exp_max, locations, max_np, ctc_ceiling, freshness, min_score,
         )
-        return _defaults_from_jd(settings, jd)
 
-    path = matches[0]
-    text = path.read_text(encoding="utf-8")
+        return HardFilter(
+            mandatory_skills=mandatory,
+            preferred_skills=preferred,
+            experience_min=exp_min,
+            experience_max=exp_max,
+            locations=locations,
+            max_notice_period_days=max_np,
+            ctc_ceiling_lacs=ctc_ceiling,
+            freshness_days=int(freshness),
+            min_ai_score=min_score,
+        )
 
-    mandatory = _parse_bullets(_section_block(text, "Mandatory Skills"))
-    preferred = _parse_bullets(_section_block(text, "Preferred Skills"))
-
-    exp_kv = _parse_kv(_section_block(text, "Experience"))
-    exp_min = int(exp_kv.get("min_years", jd.experience_min))
-    exp_max = int(exp_kv.get("max_years", jd.experience_max))
-
-    locations = _parse_bullets(_section_block(text, "Location"))
-    if not locations:
-        locations = list(jd.locations)
-
-    rejection_text = _section_block(text, "Rejection Criteria")
-    max_np: int | None = None
-    for line in rejection_text.splitlines():
-        m = re.search(r"notice_period_days\s*>\s*(\d+)", line)
-        if m:
-            max_np = int(m.group(1))
-            break
-
-    ai_kv = _parse_kv(_section_block(text, "AI Screening"))
-    default_min_score = settings.raw.get("filters", {}).get("default_min_score", 60)
-    min_score = int(ai_kv.get("min_score", default_min_score))
-
-    filter_kv = _parse_kv(_section_block(text, "Filters"))
-    ctc_ceiling = _safe_float(filter_kv.get("ctc_ceiling_lacs")) or jd.ctc_ceiling_lacs
-    freshness = _safe_int(filter_kv.get("freshness_days")) or jd.freshness_days
-    if freshness is None:
-        freshness = settings.raw.get("filters", {}).get("freshness_days", 45)
-
-    if not mandatory:
-        mandatory = list(jd.skills)
+    # --- No markdown file found ---
+    # Try extracting rules from the rich JD description via Claude if available.
+    if jd.jd_description:
+        try:
+            return _extract_from_jd_description(settings, jd)
+        except Exception as exc:
+            logger.warning(
+                "Claude extraction from jd_description failed for %s: %s; "
+                "falling back to JD defaults",
+                jd.jd_id, exc,
+            )
 
     logger.info(
-        "Guidelines for %s: mandatory=%s preferred=%s exp=[%d-%d] locs=%s np<=%s ctc<=%s fresh<=%dd score>=%d",
-        jd.jd_id, mandatory, preferred, exp_min, exp_max, locations, max_np, ctc_ceiling, freshness, min_score,
+        "No guidelines file for %s; using JD defaults", jd.jd_id,
+    )
+    return _defaults_from_jd(settings, jd)
+
+
+def _extract_from_jd_description(settings: Settings, jd: JobDescription) -> HardFilter:
+    """Use Claude to extract HardFilter rules from the full JD description.
+
+    Only called when no screening_guidelines/*.md file exists AND the JD
+    has a non-empty ``jd_description`` (the rich-text column from the new
+    Excel format).
+    """
+    prompt = (
+        "You are a strict technical recruiter.  Given the following job "
+        "description, extract the screening rules needed to filter candidates "
+        "BEFORE resume download.  Return ONLY a JSON object with these keys:\n\n"
+        '  "mandatory_skills":     [list of skills a candidate MUST have],\n'
+        '  "preferred_skills":     [list of nice-to-have skills],\n'
+        '  "experience_min":       <minimum years of experience as int>,\n'
+        '  "experience_max":       <maximum years of experience as int>,\n'
+        '  "locations":            [list of allowed locations, or empty list for any],\n'
+        '  "max_notice_period_days": <max notice period in days, or null>,\n'
+        '  "ctc_ceiling_lacs":     <max CTC in LPA, or null>,\n'
+        '  "freshness_days":       <max days since last active, default 45>,\n'
+        '  "min_ai_score":         <minimum AI quality score 0-100, default 60>\n\n'
+        "=== JOB DESCRIPTION ===\n"
+        f"{jd.jd_description}\n"
+        "\nReturn ONLY the JSON object, no prose, no markdown fences."
     )
 
-    return HardFilter(
-        mandatory_skills=mandatory,
-        preferred_skills=preferred,
-        experience_min=exp_min,
-        experience_max=exp_max,
-        locations=locations,
-        max_notice_period_days=max_np,
-        ctc_ceiling_lacs=ctc_ceiling,
-        freshness_days=int(freshness),
-        min_ai_score=min_score,
+    from openai import OpenAI
+    client = OpenAI(
+        api_key=settings.litellm_api_key,
+        base_url=settings.litellm_base_url,
     )
+    cfg = settings.raw.get("ai", {})
+    resp = client.chat.completions.create(
+        model=settings.litellm_model,
+        messages=[
+            {"role": "system", "content": "You extract structured screening rules from job descriptions. Return ONLY valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=int(cfg.get("max_tokens", 1000)),
+        temperature=0.0,
+        timeout=int(cfg.get("request_timeout_sec", 60)),
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    parsed = json.loads(raw)
+
+    filters_cfg = settings.raw.get("filters", {})
+    default_min = filters_cfg.get("default_min_score", 60)
+    default_fresh = filters_cfg.get("freshness_days", 45)
+    default_ctc = filters_cfg.get("default_ctc_ceiling_lacs")
+
+    # Claude may return null for experience fields — fall back to JD defaults
+    exp_min = parsed.get("experience_min")
+    if exp_min is None:
+        exp_min = jd.experience_min
+    exp_max = parsed.get("experience_max")
+    if exp_max is None:
+        exp_max = jd.experience_max
+
+    hf = HardFilter(
+        mandatory_skills=parsed.get("mandatory_skills") or list(jd.skills),
+        preferred_skills=parsed.get("preferred_skills") or [],
+        experience_min=int(exp_min),
+        experience_max=int(exp_max),
+        locations=parsed.get("locations") or list(jd.locations),
+        max_notice_period_days=parsed.get("max_notice_period_days"),
+        ctc_ceiling_lacs=parsed.get("ctc_ceiling_lacs") or jd.ctc_ceiling_lacs or default_ctc,
+        freshness_days=int(parsed.get("freshness_days", default_fresh)),
+        min_ai_score=int(parsed.get("min_ai_score", default_min)),
+    )
+
+    logger.info(
+        "Guidelines from jd_description for %s: mandatory=%s preferred=%s "
+        "exp=[%d-%d] locs=%s np<=%s ctc<=%s fresh<=%dd score>=%d",
+        jd.jd_id, hf.mandatory_skills, hf.preferred_skills,
+        hf.experience_min, hf.experience_max, hf.locations,
+        hf.max_notice_period_days, hf.ctc_ceiling_lacs,
+        hf.freshness_days, hf.min_ai_score,
+    )
+    return hf
 
 
 def _defaults_from_jd(settings: Settings, jd: JobDescription) -> HardFilter:
-    default_min_score = settings.raw.get("filters", {}).get("default_min_score", 60)
-    default_freshness = settings.raw.get("filters", {}).get("freshness_days", 45)
+    filters_cfg = settings.raw.get("filters", {})
+    default_min_score = filters_cfg.get("default_min_score", 60)
+    default_freshness = filters_cfg.get("freshness_days", 45)
+    default_ctc = filters_cfg.get("default_ctc_ceiling_lacs")
     return HardFilter(
         mandatory_skills=list(jd.skills),
         experience_min=jd.experience_min,
         experience_max=jd.experience_max,
         locations=list(jd.locations),
-        ctc_ceiling_lacs=jd.ctc_ceiling_lacs,
+        ctc_ceiling_lacs=jd.ctc_ceiling_lacs or default_ctc,
         freshness_days=int(jd.freshness_days or default_freshness),
         min_ai_score=int(default_min_score),
     )
@@ -225,12 +326,16 @@ Return ONLY the query string, no prose, no markdown fences."""
 def _build_boolean_prompt(jd_dict: dict[str, Any], hint: str | None) -> str:
     hint_block = f"\nTA refinement hint: {hint}\n" if hint else ""
     skills_list = ", ".join(jd_dict.get("skills", []))
+    # Include full JD description when available for richer boolean generation
+    desc = jd_dict.get("jd_description", "").strip()
+    desc_block = f"\nFull Job Description:\n{desc[:2000]}\n" if desc else ""
     return (
         "Generate a single Naukri Resdex boolean query for this JD.\n\n"
         f"Role: {jd_dict.get('role')}\n"
         f"Skills: {skills_list}\n"
         f"Experience: {jd_dict.get('experience_min')}-{jd_dict.get('experience_max')} years\n"
         f"Locations: {', '.join(jd_dict.get('locations', []))}\n"
+        f"{desc_block}"
         f"{hint_block}\n"
         "Rules:\n"
         "- Use AND for mandatory skills, OR for alternatives\n"

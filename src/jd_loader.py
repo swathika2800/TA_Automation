@@ -11,12 +11,20 @@ list of normalized `JobDescription` objects. The loader is forgiving:
   * Blank rows are dropped.
   * Multiple header candidates are tried (first sheet, by default).
 
-Expected columns (exact or via alias):
-  JD_ID | Role | Skills | Experience_Min_Years | Experience_Max_Years
-  | Location | Active   (Notes is optional)
+Supports two Excel formats:
 
-To use the company's own file, drop it at `jd_input/jds.xlsx` (default) or
-pass `excel_path=` to point at any other file.
+  1) **Legacy format** (jds.xlsx):
+     JD_ID | Role | Skills | Experience_Min_Years | Experience_Max_Years
+     | Location | Active   (Notes is optional)
+
+  2) **Naukri Search Automation format**:
+     Job ID | Job Title | Job Description | Location | Experience Required
+     | Key Skills | Priority | Status | Profiles Found | Last Run
+
+The loader auto-detects which format is in use and parses accordingly.
+To use the company's own file, drop it at `jd_input/` (default file name:
+`Naukri Search Automation — Job Openings.xlsx`) or pass `excel_path=` to
+point at any other file.
 """
 from __future__ import annotations
 
@@ -36,24 +44,35 @@ CANONICAL_COLUMNS = (
     "Experience_Min_Years", "Experience_Max_Years",
     "Location", "Active", "Notes",
     "CTC_Ceiling_Lacs", "Freshness_Days",
+    "JD_Description", "Experience_Raw",
 )
 
 # Aliases allow the company file to use human-friendly headers.
 # Keys are lowercased + whitespace-stripped versions of what may appear in
 # the Excel; values are the canonical names the rest of the pipeline uses.
 COLUMN_ALIASES: dict[str, str] = {
+    # ---- JD identification ----
     "jd_id": "JD_ID",
     "jd id": "JD_ID",
     "jd": "JD_ID",
     "id": "JD_ID",
+    "job id": "JD_ID",
+
+    # ---- Role / Title ----
     "role": "Role",
     "title": "Role",
     "position": "Role",
     "job role": "Role",
+    "job title": "Role",
+
+    # ---- Skills ----
     "skills": "Skills",
     "required skills": "Skills",
     "skills required": "Skills",
     "tech stack": "Skills",
+    "key skills": "Skills",
+
+    # ---- Experience (separate min/max columns) ----
     "experience_min_years": "Experience_Min_Years",
     "min years": "Experience_Min_Years",
     "min_experience": "Experience_Min_Years",
@@ -67,15 +86,29 @@ COLUMN_ALIASES: dict[str, str] = {
     "experience_max": "Experience_Max_Years",
     "max exp": "Experience_Max_Years",
     "experience": "Experience_Min_Years",
+
+    # ---- Experience (combined range, e.g. "5-8 yrs") ----
+    "experience required": "Experience_Raw",
+
+    # ---- Full JD description text ----
+    "job description": "JD_Description",
+
+    # ---- Location ----
     "location": "Location",
     "city": "Location",
     "locations": "Location",
+
+    # ---- Active / Status ----
     "active": "Active",
     "enabled": "Active",
     "status": "Active",
+
+    # ---- Notes ----
     "notes": "Notes",
     "comments": "Notes",
     "remarks": "Notes",
+
+    # ---- CTC ----
     "ctc_ceiling_lacs": "CTC_Ceiling_Lacs",
     "ctc ceiling": "CTC_Ceiling_Lacs",
     "ctc": "CTC_Ceiling_Lacs",
@@ -83,6 +116,8 @@ COLUMN_ALIASES: dict[str, str] = {
     "max_ctc": "CTC_Ceiling_Lacs",
     "salary cap": "CTC_Ceiling_Lacs",
     "ctc cap": "CTC_Ceiling_Lacs",
+
+    # ---- Freshness ----
     "freshness_days": "Freshness_Days",
     "freshness": "Freshness_Days",
     "active in days": "Freshness_Days",
@@ -104,6 +139,7 @@ class JobDescription:
     notes: str
     ctc_ceiling_lacs: float | None = None
     freshness_days: int | None = None
+    jd_description: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,6 +152,7 @@ class JobDescription:
             "notes": self.notes,
             "ctc_ceiling_lacs": self.ctc_ceiling_lacs,
             "freshness_days": self.freshness_days,
+            "jd_description": self.jd_description,
         }
 
 
@@ -134,7 +171,10 @@ def _truthy(value: Any) -> bool:
         return False
     if isinstance(value, float) and pd.isna(value):
         return False
-    return str(value).strip().upper() in {"TRUE", "1", "YES", "Y", "ACTIVE", "OPEN"}
+    return str(value).strip().upper() in {
+        "TRUE", "1", "YES", "Y", "ACTIVE", "OPEN",
+        "PENDING", "IN PROGRESS",
+    }
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
@@ -166,6 +206,26 @@ def _coerce_float(value: Any) -> float | None:
 _RANGE_RE = re.compile(r"(\d+)\s*[-–to]+\s*(\d+)", re.IGNORECASE)
 
 
+_RANGE_RAW_RE = re.compile(r"(\d+)\s*(?:[-–+to]+\s*)+(\d+)", re.IGNORECASE)
+
+
+def _parse_range_string(text: str) -> tuple[int, int]:
+    """Parse a combined range string like '5-8 yrs', '5+ to 8+ Years'.
+
+    Returns (min, max).  Falls back to (0, 0) when nothing can be parsed.
+    """
+    if not text:
+        return 0, 0
+    m = _RANGE_RAW_RE.search(text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    single = re.search(r"\d+", text)
+    if single:
+        v = int(single.group(0))
+        return v, v
+    return 0, 0
+
+
 def _parse_experience(min_v: Any, max_v: Any, fallback: Any) -> tuple[int, int]:
     mn = _coerce_int(min_v, default=0)
     mx = _coerce_int(max_v, default=0)
@@ -193,11 +253,14 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _find_header_row(raw: pd.DataFrame) -> int:
-    """Find the row that looks like a header line (contains 'JD' and 'Role')."""
+    """Find the row that looks like a header line (contains 'JD'/'Job ID' and
+    'Role'/'Title'/'Position')."""
     for i, row in raw.iterrows():
         cells = [str(v).strip().lower() for v in row.tolist() if pd.notna(v)]
         joined = " ".join(cells)
-        if "jd" in joined and ("role" in joined or "title" in joined or "position" in joined):
+        has_jd = "jd" in joined or "job id" in joined
+        has_role = "role" in joined or "title" in joined or "position" in joined
+        if has_jd and has_role:
             return i
     return 0
 
@@ -223,11 +286,21 @@ def _read_excel(path: Path) -> pd.DataFrame:
 
 
 def _row_to_jd(row: pd.Series) -> JobDescription:
-    exp_min, exp_max = _parse_experience(
-        row.get("Experience_Min_Years"),
-        row.get("Experience_Max_Years"),
-        row.get("Experience_Min_Years") or row.get("Experience_Max_Years"),
-    )
+    # --- Experience: try separate min/max columns first, then raw range ---
+    exp_raw = row.get("Experience_Raw")
+    if pd.notna(exp_raw) and str(exp_raw).strip():
+        exp_min, exp_max = _parse_range_string(str(exp_raw))
+    else:
+        exp_min, exp_max = _parse_experience(
+            row.get("Experience_Min_Years"),
+            row.get("Experience_Max_Years"),
+            row.get("Experience_Min_Years") or row.get("Experience_Max_Years"),
+        )
+
+    # --- JD Description (rich text) ---
+    jd_desc = row.get("JD_Description")
+    jd_description = str(jd_desc).strip() if pd.notna(jd_desc) else ""
+
     return JobDescription(
         jd_id=str(row["JD_ID"]).strip(),
         role=str(row["Role"]).strip(),
@@ -238,6 +311,7 @@ def _row_to_jd(row: pd.Series) -> JobDescription:
         notes=str(row.get("Notes", "") or "").strip(),
         ctc_ceiling_lacs=_coerce_float(row.get("CTC_Ceiling_Lacs")),
         freshness_days=_coerce_int(row.get("Freshness_Days")) or None,
+        jd_description=jd_description,
     )
 
 
@@ -246,13 +320,25 @@ def load_jds(
     jd_id_filter: str | None = None,
     excel_path: Path | None = None,
 ) -> list[JobDescription]:
-    path = excel_path or (settings.jd_input_dir / "jds.xlsx")
-    if not path.exists():
-        raise FileNotFoundError(
-            f"JD Excel not found: {path}\n"
-            f"Place the company-maintained JD sheet at this location "
-            f"(see jd_input/jds_sample.xlsx for the expected schema)."
-        )
+    if excel_path:
+        path = excel_path
+    else:
+        # Auto-detect: prefer the Naukri Search Automation format, fall back
+        # to the legacy jds.xlsx.
+        new_style = settings.jd_input_dir / "Naukri Search Automation — Job Openings.xlsx"
+        old_style = settings.jd_input_dir / "jds.xlsx"
+        if new_style.exists():
+            path = new_style
+        elif old_style.exists():
+            path = old_style
+        else:
+            raise FileNotFoundError(
+                f"No JD Excel found in {settings.jd_input_dir}.\n"
+                f"Expected either:\n"
+                f"  - Naukri Search Automation — Job Openings.xlsx  (new format)\n"
+                f"  - jds.xlsx                                       (legacy format)\n"
+                f"See jd_input/jds_sample.xlsx for the expected schema."
+            )
 
     logger.info("Loading JDs from %s", path)
     df = _read_excel(path)
